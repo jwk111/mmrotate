@@ -168,7 +168,8 @@ class DOTADataset(CustomDataset):
                  proposal_nums=(100, 300, 1000),
                  iou_thr=0.5,
                  scale_ranges=None,
-                 nproc=4):
+                 nproc=4,
+                 det_iou_thr=0.5):
         """Evaluate the dataset.
 
         Args:
@@ -205,7 +206,8 @@ class DOTADataset(CustomDataset):
                 iou_thr=iou_thr,
                 dataset=self.CLASSES,
                 logger=logger,
-                nproc=nproc)
+                nproc=nproc,
+                det_iou_thr=det_iou_thr)
             eval_results['mAP'] = mean_ap
         else:
             raise NotImplementedError

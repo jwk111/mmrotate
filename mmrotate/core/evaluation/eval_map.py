@@ -93,10 +93,37 @@ def tpfp_default(det_bboxes,
                     fp[k, i] = 1
     return tp, fp
 
+def get_all_results(det_results, annotations):
+    """Get det results and gt information of a certain class.
+
+    Args:
+        det_results (list[list]): Same as `eval_map()`.
+        annotations (list[dict]): Same as `eval_map()`.
+        class_id (int): ID of a specific class.
+
+    Returns:
+        tuple[list[np.ndarray]]: detected bboxes, gt bboxes, ignored gt bboxes
+    """
+    # 把所有类别的检测框信息都放在一个list中
+    all_dets = det_results.copy()
+    for img_id in range(len(all_dets)):
+        ori_format = np.asarray(all_dets[img_id].copy())
+        all_dets[img_id] = []
+        for cls_num, cls_dets in enumerate(ori_format):
+            if len(all_dets[img_id]) == 0:
+                all_dets[img_id] = np.asarray(cls_dets)
+            else:
+                all_dets[img_id] = np.concatenate((all_dets[img_id], cls_dets),axis=0)
+    all_gts = [ann['bboxes'] for ann in annotations]
+
+    cls_gts_ignore = []
+    for ann in annotations:
+        cls_gts_ignore.append(torch.zeros((0, 5), dtype=torch.float64))
+    return all_dets, all_gts, cls_gts_ignore
 
 def get_cls_results(det_results, annotations, class_id):
     """Get det results and gt information of a certain class.
-
+    把所有的检测结果和gt信息都拿出来，按照类别分开保存
     Args:
         det_results (list[list]): Same as `eval_map()`.
         annotations (list[dict]): Same as `eval_map()`.
@@ -123,6 +150,34 @@ def get_cls_results(det_results, annotations, class_id):
     return cls_dets, cls_gts, cls_gts_ignore
 
 
+def detection_calcu(tdfd):
+    td, _ = tuple(zip(*tdfd))
+    return np.sum(np.hstack(td), axis=1)[0]
+
+
+import numpy as np
+
+def calculate_precision_recall(cls_dets, tp, fp, num_gts):
+    """
+    Calculate precision and recall given detection results and ground truth information.
+    """
+    # sort all det bboxes by score, also sort tp and fp
+    cls_dets = np.vstack(cls_dets)
+    num_dets = cls_dets.shape[0]
+    sort_inds = np.argsort(-cls_dets[:, -1])
+    tp = np.hstack(tp)[:, sort_inds]
+    fp = np.hstack(fp)[:, sort_inds]
+    # calculate recall and precision with tp and fp
+    tp = np.cumsum(tp, axis=1)
+    fp = np.cumsum(fp, axis=1)
+    eps = np.finfo(np.float32).eps
+    recalls = tp / np.maximum(num_gts[:, np.newaxis], eps)
+    precisions = tp / np.maximum((tp + fp), eps)
+
+    return recalls, precisions, num_dets
+
+
+
 def eval_rbbox_map(det_results,
                    annotations,
                    scale_ranges=None,
@@ -130,7 +185,8 @@ def eval_rbbox_map(det_results,
                    use_07_metric=True,
                    dataset=None,
                    logger=None,
-                   nproc=4):
+                   nproc=4,
+                   det_iou_thr=0.5):
     """Evaluate mAP of a rotated dataset.
 
     Args:
@@ -172,6 +228,22 @@ def eval_rbbox_map(det_results,
 
     pool = get_context('spawn').Pool(nproc)
     eval_results = []
+
+    '''############ 计算所有类别的检测率 ############'''
+    all_cls_dets, all_cls_gts, all_gt_ignore= get_all_results(det_results, annotations)
+    tdfd = pool.starmap(
+        tpfp_default,
+        zip(all_cls_dets, all_cls_gts, all_gt_ignore,
+            [det_iou_thr for _ in range(num_imgs)],
+            [area_ranges for _ in range(num_imgs)]))
+
+    td = detection_calcu(tdfd)
+    detection = td / len(np.vstack(all_cls_gts))
+    '''########### 计算所有类别的识别率 ##############'''
+    all_tp_num = 0.0
+    all_gt_num = 0.0
+    '''###########################################'''
+
     for i in range(num_classes):
         # get gt and det bboxes of this class
         cls_dets, cls_gts, cls_gts_ignore = get_cls_results(
@@ -195,18 +267,9 @@ def eval_rbbox_map(det_results,
                 for k, (min_area, max_area) in enumerate(area_ranges):
                     num_gts[k] += np.sum((gt_areas >= min_area)
                                          & (gt_areas < max_area))
-        # sort all det bboxes by score, also sort tp and fp
-        cls_dets = np.vstack(cls_dets)
-        num_dets = cls_dets.shape[0]
-        sort_inds = np.argsort(-cls_dets[:, -1])
-        tp = np.hstack(tp)[:, sort_inds]
-        fp = np.hstack(fp)[:, sort_inds]
-        # calculate recall and precision with tp and fp
-        tp = np.cumsum(tp, axis=1)
-        fp = np.cumsum(fp, axis=1)
-        eps = np.finfo(np.float32).eps
-        recalls = tp / np.maximum(num_gts[:, np.newaxis], eps)
-        precisions = tp / np.maximum((tp + fp), eps)
+                    
+        recalls, precisions, num_dets = calculate_precision_recall(cls_dets, tp, fp, num_gts)
+
         # calculate AP
         if scale_ranges is None:
             recalls = recalls[0, :]
@@ -214,13 +277,40 @@ def eval_rbbox_map(det_results,
             num_gts = num_gts.item()
         mode = 'area' if not use_07_metric else '11points'
         ap = average_precision(recalls, precisions, mode)
+
+        '''##############  计算每一类的检测率  ##################'''
+        tdfd = pool.starmap(
+            tpfp_default,
+            zip(all_cls_dets, cls_gts, cls_gts_ignore,
+                [det_iou_thr for _ in range(num_imgs)],
+                [area_ranges for _ in range(num_imgs)]),
+        )
+        td_cls = detection_calcu(tdfd)
+        cls_detection = td_cls / num_gts
+        '''############### 计算每一类的识别率 ###################'''
+        tpfp = pool.starmap(
+            tpfp_default,
+            zip(cls_dets, cls_gts, cls_gts_ignore,
+                [det_iou_thr for _ in range(num_imgs)],
+                [area_ranges for _ in range(num_imgs)]),
+        )
+        tp_cls = detection_calcu(tpfp)
+        recogRate = tp_cls / num_gts
+        all_tp_num += tp_cls
+        all_gt_num += num_gts
+        '''###################################################'''
+
+
         eval_results.append({
             'num_gts': num_gts,
             'num_dets': num_dets,
             'recall': recalls,
             'precision': precisions,
-            'ap': ap
+            'ap': ap,
+            'cls_detection': cls_detection,
+            'recogRate': recogRate,
         })
+    all_recogRate = all_tp_num / all_gt_num
     pool.close()
     if scale_ranges is not None:
         # shape (num_classes, num_scales)
@@ -240,14 +330,18 @@ def eval_rbbox_map(det_results,
                 aps.append(cls_result['ap'])
         mean_ap = np.array(aps).mean().item() if aps else 0.0
 
+    # detection = td/num_gts
+
     print_map_summary(
-        mean_ap, eval_results, dataset, area_ranges, logger=logger)
+        mean_ap, eval_results, detection, all_recogRate, dataset, area_ranges,logger=logger)
 
     return mean_ap, eval_results
 
 
 def print_map_summary(mean_ap,
                       results,
+                      detection,
+                      all_recogRate,
                       dataset=None,
                       scale_ranges=None,
                       logger=None):
@@ -294,8 +388,7 @@ def print_map_summary(mean_ap,
 
     if not isinstance(mean_ap, list):
         mean_ap = [mean_ap]
-
-    header = ['class', 'gts', 'dets', 'recall', 'ap']
+    header = ['class', 'gts', 'dets', 'recall', 'ap' ,'检测率', '识别率']
     for i in range(num_scales):
         if scale_ranges is not None:
             print_log(f'Scale range {scale_ranges[i]}', logger=logger)
@@ -303,10 +396,13 @@ def print_map_summary(mean_ap,
         for j in range(num_classes):
             row_data = [
                 label_names[j], num_gts[i, j], results[j]['num_dets'],
-                f'{recalls[i, j]:.3f}', f'{aps[i, j]:.3f}'
+                f'{recalls[i, j]:.3f}', f'{aps[i, j]:.3f}', f'{results[j]["cls_detection"]:.3f}',f'{results[j]["recogRate"]:.3f}'
             ]
             table_data.append(row_data)
+
+
         table_data.append(['mAP', '', '', '', f'{mean_ap[i]:.3f}'])
+        table_data.append(['所有类', '', '', '', '', f'{detection:.3f}', f'{all_recogRate:.3f}'])
         table = AsciiTable(table_data)
         table.inner_footing_row_border = True
         print_log('\n' + table.table, logger=logger)
